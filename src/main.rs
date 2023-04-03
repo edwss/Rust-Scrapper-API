@@ -1,6 +1,7 @@
 use bollard::container::{Config, RemoveContainerOptions};
 use bollard::service::{ContainerCreateResponse, CreateImageInfo, HostConfig, Mount};
 use bollard::Docker;
+use futures::future;
 use std::error::Error;
 use tokio::signal;
 use warp::{http, Filter};
@@ -8,7 +9,6 @@ use warp::{http, Filter};
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
 use futures_util::{stream::StreamExt, TryStreamExt};
-use json;
 
 const IMAGE: &str = "ultrafunk/undetected-chromedriver:latest";
 
@@ -18,6 +18,7 @@ async fn main() {
     create_image(docker.clone()).await;
     let response = create_container(docker.clone()).await.unwrap();
     let _ = docker.start_container::<String>(&response.id, None).await;
+    let container_id = &response.id.clone();
 
     let vizer_home = warp::get().and(
         warp::path("vizer")
@@ -27,12 +28,25 @@ async fn main() {
             .and_then(move || home_page(docker.clone(), response.id.clone())),
     );
 
-    // GET /hello/warp => 200 OK with body "Hello, warp!"
+
+    // // GET /hello/warp => 200 OK with body "Hello, warp!"
     let hello = warp::path!("hello" / String).map(|name| format!("Hello, {}!", name));
 
     let routes = vizer_home.or(hello);
 
-    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
+    let serve_handler = warp::serve(routes);
+    tokio::spawn(serve_handler.run(([0, 0, 0, 0], 3030)));
+
+    match signal::ctrl_c().await {
+        Ok(()) => {
+            remove_container(container_id.to_string()).await;
+            println!("Done")
+        }
+        Err(err) => {
+            eprintln!("Unable to listen for shutdown signal: {}", err);
+            // we also shut down in case of error
+        }
+    }
 }
 
 async fn home_page(docker: Docker, id: String) -> Result<impl warp::Reply, warp::Rejection> {
@@ -89,7 +103,8 @@ async fn create_container(
     }
 }
 
-async fn remove_container(docker: Docker, id: String) {
+async fn remove_container(id: String) {
+    let docker = Docker::connect_with_socket_defaults().unwrap();
     let _ = docker
         .remove_container(
             &id,
