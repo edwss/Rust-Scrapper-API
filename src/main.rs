@@ -14,51 +14,81 @@ const IMAGE: &str = "ultrafunk/undetected-chromedriver:latest";
 
 #[tokio::main]
 async fn main() {
-    let docker = Docker::connect_with_socket_defaults().unwrap();
-    create_image(docker.clone()).await;
-    let response = create_container(docker.clone()).await.unwrap();
-    let _ = docker.start_container::<String>(&response.id, None).await;
-    let container_id = &response.id.clone();
+    let running_container = vizer_inicialization().await;
 
+    let container_id = running_container.clone();
     let vizer_home = warp::get().and(
         warp::path("vizer")
             .and(warp::path("v1"))
             .and(warp::path("home"))
             .and(warp::path::end())
-            .and_then(move || home_page(docker.clone(), response.id.clone())),
+            .and_then(move || home(container_id.clone())),
     );
 
+    let container_id = running_container.clone();
+    let vizer_search = warp::get().and(
+        warp::path("vizer")
+            .and(warp::path("v1"))
+            .and(warp::path("search"))
+            .and(warp::path::param()
+            .and_then(move |title: String| search(container_id.clone(), title.clone())))
+            .and(warp::path::end())
+    );
 
-    // // GET /hello/warp => 200 OK with body "Hello, warp!"
     let hello = warp::path!("hello" / String).map(|name| format!("Hello, {}!", name));
 
-    let routes = vizer_home.or(hello);
+    let routes = vizer_home.or(vizer_search).or(hello);
 
     let serve_handler = warp::serve(routes);
     tokio::spawn(serve_handler.run(([0, 0, 0, 0], 3030)));
 
     match signal::ctrl_c().await {
         Ok(()) => {
+            let container_id = running_container.clone();
             remove_container(container_id.to_string()).await;
             println!("Done")
         }
         Err(err) => {
             eprintln!("Unable to listen for shutdown signal: {}", err);
-            // we also shut down in case of error
         }
     }
 }
 
-async fn home_page(docker: Docker, id: String) -> Result<impl warp::Reply, warp::Rejection> {
-    let response = exec(docker, &id).await;
+async fn vizer_inicialization() -> String {
+    let _ = create_image().await.unwrap();
+    let response = create_container().await.unwrap();
+
+    let container_id = response.id.clone();
+
+    let docker = Docker::connect_with_socket_defaults().unwrap();
+    let _ = docker.start_container::<String>(&response.id, None).await.unwrap();
+    
+    container_id
+}
+
+async fn home(id: String) -> Result<impl warp::Reply, warp::Rejection> {
+    let docker = Docker::connect_with_socket_defaults().unwrap();
+    let command = "/data/main_page.py";
+    let response = exec(docker, &id, command, "").await;
     Ok(warp::reply::with_status(
         response.replace("'", "\""),
         http::StatusCode::OK,
     ))
 }
 
-async fn create_image(docker: Docker) {
-    _ = docker
+async fn search(id: String, title: String) -> Result<impl warp::Reply, warp::Rejection> {
+    let docker = Docker::connect_with_socket_defaults().unwrap();
+    let command = "/data/search.py";
+    let response = exec(docker, &id, command, &title).await;
+    Ok(warp::reply::with_status(
+        response.replace("'", "\""),
+        http::StatusCode::OK,
+    ))
+}
+
+async fn create_image() -> Result<Vec<CreateImageInfo>, bollard::errors::Error> {
+    let docker = Docker::connect_with_socket_defaults().unwrap();
+    match docker
         .create_image(
             Some(CreateImageOptions {
                 from_image: IMAGE,
@@ -66,14 +96,19 @@ async fn create_image(docker: Docker) {
             }),
             None,
             None,
-        )
-        .try_collect::<Vec<_>>()
-        .await;
+        ).try_collect::<Vec<_>>().await {
+        Ok(response) => {
+            return Ok(response)
+        },
+        Err(err) => return Err(err)
+    }
 }
 
 async fn create_container(
-    docker: Docker,
 ) -> Result<ContainerCreateResponse, bollard::errors::Error> {
+    let c_1gb = 1073741824; //1 GB in bytes
+    let docker = Docker::connect_with_socket_defaults().unwrap();
+
     let mut mounts = Vec::<Mount>::new();
     mounts.push(Mount {
         target: Some("/data".to_string()),
@@ -82,20 +117,21 @@ async fn create_container(
         read_only: Some(false),
         ..Default::default()
     });
-    let alpine_config = Config {
+
+    let container_config = Config {
         image: Some(IMAGE),
         tty: Some(true),
         entrypoint: Some(vec!["./entrypoint.sh", "bash"]),
         host_config: Some(HostConfig {
             mounts: Some(mounts),
-            shm_size: Some(1073741824),
+            shm_size: Some(c_1gb),
             ..Default::default()
         }),
         ..Default::default()
     };
 
     match docker
-        .create_container::<&str, &str>(None, alpine_config)
+        .create_container::<&str, &str>(None, container_config)
         .await
     {
         Ok(it) => return Ok(it),
@@ -116,14 +152,14 @@ async fn remove_container(id: String) {
         .await;
 }
 
-async fn exec(docker: Docker, id: &str) -> String {
+async fn exec(docker: Docker, id: &str, command: &str, arg: &str) -> String {
     let exec = docker
         .create_exec(
             &id,
             CreateExecOptions {
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
-                cmd: Some(vec!["python", "/data/main_page.py"]),
+                cmd: Some(vec!["python", command, arg]),
                 ..Default::default()
             },
         )
