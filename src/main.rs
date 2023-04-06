@@ -1,8 +1,6 @@
 use bollard::container::{Config, RemoveContainerOptions};
 use bollard::service::{ContainerCreateResponse, CreateImageInfo, HostConfig, Mount};
 use bollard::Docker;
-use futures::future;
-use std::error::Error;
 use tokio::signal;
 use warp::{http, Filter};
 
@@ -30,14 +28,56 @@ async fn main() {
         warp::path("vizer")
             .and(warp::path("v1"))
             .and(warp::path("search"))
-            .and(warp::path::param()
-            .and_then(move |title: String| search(container_id.clone(), title.clone())))
-            .and(warp::path::end())
+            .and(
+                warp::path::param()
+                    .and_then(move |title: String| search(container_id.clone(), title.clone())),
+            )
+            .and(warp::path::end()),
+    );
+
+    let container_id = running_container.clone();
+    let vizer_parse = warp::get().and(
+        warp::path("vizer")
+            .and(warp::path("v1"))
+            .and(warp::path("parse"))
+            .and(warp::path("serie"))
+            .and(warp::path("online"))
+            .and(
+                warp::path::param()
+                    .and_then(move |title: String| parse(container_id.clone(), "serie".to_string(), title.clone())),
+            )
+            .and(warp::path::end()),
+    );
+
+    let container_id = running_container.clone();
+    let vizer_episodes = warp::get().and(
+        warp::path("vizer")
+            .and(warp::path("v1"))
+            .and(warp::path("serie"))
+            .and(warp::path("episodes"))
+            .and(
+                warp::path::param()
+                    .and_then(move |title: String| episodes(container_id.clone(), title.clone())),
+            )
+            .and(warp::path::end()),
+    );
+
+    let container_id = running_container.clone();
+    let vizer_episode_streaming = warp::get().and(
+        warp::path("vizer")
+            .and(warp::path("v1"))
+            .and(warp::path("serie"))
+            .and(warp::path("stream"))
+            .and(
+                warp::path::param()
+                    .and_then(move |episode_id: String| streaming(container_id.clone(), episode_id.clone())),
+            )
+            .and(warp::path::end()),
     );
 
     let hello = warp::path!("hello" / String).map(|name| format!("Hello, {}!", name));
 
-    let routes = vizer_home.or(vizer_search).or(hello);
+    let routes = vizer_home.or(vizer_search).or(vizer_parse).or(vizer_episodes).or(vizer_episode_streaming).or(hello);
 
     let serve_handler = warp::serve(routes);
     tokio::spawn(serve_handler.run(([0, 0, 0, 0], 3030)));
@@ -61,8 +101,11 @@ async fn vizer_inicialization() -> String {
     let container_id = response.id.clone();
 
     let docker = Docker::connect_with_socket_defaults().unwrap();
-    let _ = docker.start_container::<String>(&response.id, None).await.unwrap();
-    
+    let _ = docker
+        .start_container::<String>(&response.id, None)
+        .await
+        .unwrap();
+
     container_id
 }
 
@@ -86,6 +129,37 @@ async fn search(id: String, title: String) -> Result<impl warp::Reply, warp::Rej
     ))
 }
 
+async fn parse(id: String, item_type: String, title: String) -> Result<impl warp::Reply, warp::Rejection> {
+    let docker = Docker::connect_with_socket_defaults().unwrap();
+    let command = "/data/parse.py";
+    let args = format!("{}/{}/{}", item_type, "online", title);
+    let response = exec(docker, &id, command, &args).await;
+    Ok(warp::reply::with_status(
+        response.replace("'", "\""),
+        http::StatusCode::OK,
+    ))
+}
+
+async fn episodes(id: String, season_id: String) -> Result<impl warp::Reply, warp::Rejection> {
+    let docker = Docker::connect_with_socket_defaults().unwrap();
+    let command = "/data/get_episodes.py";
+    let response = exec(docker, &id, command, &season_id).await;
+    Ok(warp::reply::with_status(
+        response.replace("'", "\""),
+        http::StatusCode::OK,
+    ))
+}
+
+async fn streaming(id: String, episode_id: String) -> Result<impl warp::Reply, warp::Rejection> {
+    let docker = Docker::connect_with_socket_defaults().unwrap();
+    let command = "/data/stream.py";
+    let response = exec(docker, &id, command, &episode_id).await;
+    Ok(warp::reply::with_status(
+        response.replace("'", "\""),
+        http::StatusCode::OK,
+    ))
+}
+
 async fn create_image() -> Result<Vec<CreateImageInfo>, bollard::errors::Error> {
     let docker = Docker::connect_with_socket_defaults().unwrap();
     match docker
@@ -96,16 +170,16 @@ async fn create_image() -> Result<Vec<CreateImageInfo>, bollard::errors::Error> 
             }),
             None,
             None,
-        ).try_collect::<Vec<_>>().await {
-        Ok(response) => {
-            return Ok(response)
-        },
-        Err(err) => return Err(err)
+        )
+        .try_collect::<Vec<_>>()
+        .await
+    {
+        Ok(response) => return Ok(response),
+        Err(err) => return Err(err),
     }
 }
 
-async fn create_container(
-) -> Result<ContainerCreateResponse, bollard::errors::Error> {
+async fn create_container() -> Result<ContainerCreateResponse, bollard::errors::Error> {
     let c_1gb = 1073741824; //1 GB in bytes
     let docker = Docker::connect_with_socket_defaults().unwrap();
 
