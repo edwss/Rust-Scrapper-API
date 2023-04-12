@@ -7,35 +7,47 @@ use warp::{http, Filter};
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
 use futures_util::{stream::StreamExt, TryStreamExt};
+use std::time::{Instant, Duration};
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 const IMAGE: &str = "ultrafunk/undetected-chromedriver:latest";
 
+pub struct Request {
+    response: String,
+    timeout: Instant
+}
+
 #[tokio::main]
 async fn main() {
+    let request_cache = Arc::new(Mutex::new(HashMap::<String, Request>::new()));
     let running_container = vizer_inicialization().await;
 
     let container_id = running_container.clone();
+    let cache = request_cache.clone();
     let vizer_home = warp::get().and(
         warp::path("vizer")
             .and(warp::path("v1"))
             .and(warp::path("home"))
             .and(warp::path::end())
-            .and_then(move || home(container_id.clone())),
+            .and_then(move || home(container_id.clone(), cache.clone())),
     );
 
     let container_id = running_container.clone();
+    let cache = request_cache.clone();
     let vizer_search = warp::get().and(
         warp::path("vizer")
             .and(warp::path("v1"))
             .and(warp::path("search"))
             .and(
                 warp::path::param()
-                    .and_then(move |title: String| search(container_id.clone(), title.clone())),
+                    .and_then(move |title: String| search(container_id.clone(), title.clone(), cache.clone())),
             )
             .and(warp::path::end()),
     );
 
     let container_id = running_container.clone();
+    let cache = request_cache.clone();
     let vizer_parse = warp::get().and(
         warp::path("vizer")
             .and(warp::path("v1"))
@@ -44,7 +56,7 @@ async fn main() {
             .and(warp::path("online"))
             .and(
                 warp::path::param()
-                    .and_then(move |title: String| parse(container_id.clone(), "serie".to_string(), title.clone())),
+                    .and_then(move |title: String| parse(container_id.clone(), "serie".to_string(), title.clone(), cache.clone())),
             )
             .and(warp::path::end()),
     );
@@ -109,35 +121,79 @@ async fn vizer_inicialization() -> String {
     container_id
 }
 
-async fn home(id: String) -> Result<impl warp::Reply, warp::Rejection> {
-    let docker = Docker::connect_with_socket_defaults().unwrap();
-    let command = "/data/main_page.py";
-    let response = exec(docker, &id, command, "").await;
-    Ok(warp::reply::with_status(
-        response.replace("'", "\""),
-        http::StatusCode::OK,
-    ))
+fn check_cache(request_cache: Arc<Mutex<HashMap<String, Request>>>, key: String) -> String{
+    let cache = request_cache.lock().unwrap();
+    if cache.contains_key(&key) {
+        let value = cache.get(&key).unwrap();
+        value.response.clone()
+    } else {
+        "".to_string()
+    }
 }
 
-async fn search(id: String, title: String) -> Result<impl warp::Reply, warp::Rejection> {
-    let docker = Docker::connect_with_socket_defaults().unwrap();
-    let command = "/data/search.py";
-    let response = exec(docker, &id, command, &title).await;
-    Ok(warp::reply::with_status(
-        response.replace("'", "\""),
-        http::StatusCode::OK,
-    ))
+fn insert_cache(request_cache: Arc<Mutex<HashMap<String, Request>>>, key: String, value: Request) {
+    let mut cache = request_cache.lock().unwrap();
+    cache.insert(key, value);
 }
 
-async fn parse(id: String, item_type: String, title: String) -> Result<impl warp::Reply, warp::Rejection> {
-    let docker = Docker::connect_with_socket_defaults().unwrap();
-    let command = "/data/parse.py";
-    let args = format!("{}/{}/{}", item_type, "online", title);
-    let response = exec(docker, &id, command, &args).await;
-    Ok(warp::reply::with_status(
-        response.replace("'", "\""),
-        http::StatusCode::OK,
-    ))
+async fn home(id: String, request_cache: Arc<Mutex<HashMap<String, Request>>>) -> Result<impl warp::Reply, warp::Rejection> {
+    let response = check_cache(request_cache.clone(), "home".to_string());
+    if !response.is_empty() {
+        println!("Home : Cache hit");
+        Ok(
+            warp::reply::with_status(response, http::StatusCode::OK)
+        )
+    } else {
+        println!("Home : Cache not hit");
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        let command = "/data/main_page.py";
+        let response = exec(docker, &id, command, "").await.replace("'", "\"").to_string();
+        insert_cache(request_cache.clone(), "home".to_string(), Request { response: response.clone(), timeout: Instant::now() });
+        Ok(
+            warp::reply::with_status(response, http::StatusCode::OK)
+        )
+    }
+}
+
+async fn search(id: String, title: String, request_cache: Arc<Mutex<HashMap<String, Request>>>) -> Result<impl warp::Reply, warp::Rejection> {
+    let response = check_cache(request_cache.clone(), format!("search:{}", title));
+    if !response.is_empty() {
+        println!("Search : {} : Cache hit", title);
+        Ok(
+            warp::reply::with_status(response, http::StatusCode::OK)
+        )
+    } else {
+        println!("Search : {} : Cache not hit", title);
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        let command = "/data/search.py";
+        let response = exec(docker, &id, command, &title).await.replace("'", "\"").to_string();
+        insert_cache(request_cache.clone(), format!("search:{}", title), Request { response: response.clone(), timeout: Instant::now() });
+        Ok(warp::reply::with_status(
+            response,
+            http::StatusCode::OK,
+        ))
+    }
+}
+
+async fn parse(id: String, item_type: String, title: String, request_cache: Arc<Mutex<HashMap<String, Request>>>) -> Result<impl warp::Reply, warp::Rejection> {
+    let response = check_cache(request_cache.clone(), format!("{}:{}", item_type, title));
+    if !response.is_empty() {
+        println!("Parse : {} : Cache hit", format!("{}:{}", item_type, title));
+        Ok(
+            warp::reply::with_status(response, http::StatusCode::OK)
+        )
+    } else {
+        println!("Parse : {} : Cache not hit", format!("{}:{}", item_type, title));
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        let command = "/data/parse.py";
+        let args = format!("{}/{}/{}", item_type, "online", title);
+        let response = exec(docker, &id, command, &args).await.replace("'", "\"");
+        insert_cache(request_cache.clone(), format!("{}:{}", item_type, title), Request { response: response.clone(), timeout: Instant::now() });
+        Ok(warp::reply::with_status(
+            response,
+            http::StatusCode::OK,
+        ))
+    }
 }
 
 async fn episodes(id: String, season_id: String) -> Result<impl warp::Reply, warp::Rejection> {
